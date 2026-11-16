@@ -101,6 +101,10 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+// Stored object bytes are immutable; weak keys release compression cache
+// entries when the repository no longer retains the corresponding data.
+const compressedObjects = new WeakMap<Buffer, Buffer>();
+
 /** Build a packfile (version 2, no deltas) from plain objects. */
 export function writePack(objects: Array<{ type: GitObjectType; data: Buffer }>): Buffer {
   const parts: Buffer[] = [];
@@ -111,7 +115,12 @@ export function writePack(objects: Array<{ type: GitObjectType; data: Buffer }>)
   parts.push(header);
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    let compressed = compressedObjects.get(object.data);
+    if (compressed === undefined) {
+      compressed = deflateSync(object.data);
+      compressedObjects.set(object.data, compressed);
+    }
+    parts.push(compressed);
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -166,61 +175,6 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
   return result;
 }
 
-/** Adler-32, the checksum a zlib stream ends with. */
-function adler32(data: Buffer): number {
-  let a = 1;
-  let b = 0;
-  for (let i = 0; i < data.length; i += 1) {
-    a = (a + (data[i] as number)) % 65521;
-    b = (b + a) % 65521;
-  }
-  return ((b << 16) | a) >>> 0;
-}
-
-/**
- * How many input bytes the zlib stream at `start` consumes. The fast path
- * re-deflates the inflated bytes (Node's deflate is deterministic for the same
- * input and options, and the suite writes packs with the same defaults) and
- * verifies the trailing Adler-32; the fallback binary-searches with the same
- * Adler check, so a wrong guess can never slip through.
- */
-function zlibStreamLength(pack: Buffer, start: number, data: Buffer): number {
-  const adler = adler32(data);
-  const guess = deflateSync(data).length;
-  if (start + guess <= pack.length && pack.readUInt32BE(start + guess - 4) === adler) return guess;
-  let lo = 1;
-  let hi = pack.length - start;
-  let found = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    let ok = false;
-    try {
-      const trial = inflateSync(pack.subarray(start, start + mid));
-      ok = trial.length === data.length && trial.equals(data) && pack.readUInt32BE(start + mid - 4) === adler;
-    } catch {
-      ok = false;
-    }
-    if (ok) {
-      found = mid;
-      hi = mid - 1;
-    } else {
-      // A too-short prefix throws; a too-long one inflates fine but its
-      // trailing bytes are not this stream's Adler-32. Either way, test
-      // whether the prefix is at least long enough to inflate.
-      let inflates = false;
-      try {
-        inflates = inflateSync(pack.subarray(start, start + mid)).length === data.length;
-      } catch {
-        inflates = false;
-      }
-      if (inflates) hi = mid - 1;
-      else lo = mid + 1;
-    }
-  }
-  if (found < 0) throw new Error('could not bound a pack object stream');
-  return found;
-}
-
 interface PackEntry {
   type: GitObjectType;
   data: Buffer;
@@ -268,9 +222,11 @@ export function readPack(pack: Buffer, lookup: (oid: string) => GitObject | unde
     } else if (type === null) {
       throw new Error(`unknown pack object type ${typeCode}`);
     }
-    const data = inflateSync(pack.subarray(offset));
+    // zlib reports the consumed input, excluding subsequent pack objects.
+    const inflated = inflateSync(pack.subarray(offset), { info: true });
+    const data = inflated.buffer;
     if (data.length !== size) throw new Error('pack object size mismatch');
-    offset += zlibStreamLength(pack, offset, data);
+    offset += inflated.engine.bytesWritten;
     if (typeCode === 6 || typeCode === 7) {
       const base =
         baseOffset !== null

@@ -39,7 +39,7 @@ export interface TagView {
 /** git's object id: SHA-1 over `<type> <size>\0` + the object's bytes. */
 export function hashObject(type: GitObjectType, data: Buffer): string {
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  hash.update(`${type} ${data.length}\0`, 'utf8');
   hash.update(data);
   return hash.digest('hex');
 }
